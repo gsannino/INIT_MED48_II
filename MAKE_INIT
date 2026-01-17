@@ -127,11 +127,13 @@ def load_oras(
     da = ds[variable_name]
     
     # Handle fill values
-    for attr in ["_FillValue", "missing_value"]:
-        if attr in da.attrs:
-            fill_val = da.attrs[attr]
-            da = da.where(da != fill_val)
-            break
+    missing_value = da.attrs.get("missing_value")
+    fill_value = da.attrs.get("_FillValue")
+    if missing_value is not None:
+        da = da.where(da != missing_value)
+    if fill_value is not None:
+        da = da.where(da != fill_value)
+    da = da.where(np.isfinite(da))
     
     # Identify dimensions more robustly
     dim_map = {}
@@ -214,15 +216,23 @@ def build_regridder(
     method: str = "bilinear",
     periodic: Optional[bool] = None,
     weights_path: Optional[str] = None,
+    src_mask: Optional[xr.DataArray] = None,
 ) -> xe.Regridder:
     """Build xESMF regridder with optimized settings."""
     # Create source mask
-    src_mask = np.isfinite(nav_lon.values) & np.isfinite(nav_lat.values)
+    src_mask_base = np.isfinite(nav_lon.values) & np.isfinite(nav_lat.values)
+    if src_mask is not None:
+        src_mask_vals = src_mask.values.astype(bool)
+        if src_mask_vals.shape != src_mask_base.shape:
+            raise ValueError(
+                f"Source mask shape mismatch: {src_mask_vals.shape} vs {src_mask_base.shape}"
+            )
+        src_mask_base = src_mask_base & src_mask_vals
     
     ds_in = xr.Dataset({
         "lon": (nav_lon.dims, nav_lon.values),
         "lat": (nav_lat.dims, nav_lat.values),
-        "mask": (nav_lon.dims, src_mask.astype(np.int8)),
+        "mask": (nav_lon.dims, src_mask_base.astype(np.int8)),
     })
     
     ds_out = xr.Dataset({
@@ -690,15 +700,33 @@ def main() -> None:
     # Unify longitude
     nav_lon = unify_longitude(nav_lon, XC)
     
-    # Build regridders
-    with Timer("Building regridders"):
-        bilinear = build_regridder(nav_lon, nav_lat, XC, YC, "bilinear", weights_path=args.weights)
-        nearest = build_regridder(nav_lon, nav_lat, XC, YC, "nearest_s2d")
-    
     # Extract time slice
     time_dim = sal_da.dims[0]
     sal_t = sal_da.isel({time_dim: args.time_index})
     temp_t = temp_da.isel({time_dim: args.time_index})
+
+    depth_dim = [d for d in sal_da.dims if d.lower().startswith("depth")][0]
+    src_mask = np.isfinite(sal_t.isel({depth_dim: 0}))
+    
+    # Build regridders
+    with Timer("Building regridders"):
+        bilinear = build_regridder(
+            nav_lon,
+            nav_lat,
+            XC,
+            YC,
+            "bilinear",
+            weights_path=args.weights,
+            src_mask=src_mask,
+        )
+        nearest = build_regridder(
+            nav_lon,
+            nav_lat,
+            XC,
+            YC,
+            "nearest_s2d",
+            src_mask=src_mask,
+        )
     
     # Horizontal regridding
     with Timer("Horizontal regridding"):
@@ -709,7 +737,6 @@ def main() -> None:
     report_stats("Temperature after horizontal regrid", temp_h, validate=False)
     
     # Vertical interpolation
-    depth_dim = [d for d in sal_da.dims if d.lower().startswith("depth")][0]
     z_oras = sal_da.coords[depth_dim].values
     z_mit = np.abs(RC.values)
     
